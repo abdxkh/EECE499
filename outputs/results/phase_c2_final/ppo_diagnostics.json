@@ -1,0 +1,49 @@
+{
+  "worker": {
+    "approx_kl_mean": 1.5227000297324268e-09,
+    "clip_fraction_mean": 0.0,
+    "explained_variance_mean": 0.022139910817146287,
+    "critic_loss_mean": 260.54920747756955,
+    "grad_norm_mean": 105.75962136104702,
+    "entropy_mean": 5.089696455478668,
+    "last_row": {
+      "episode": 500,
+      "train_reward": -0.5966215538978576,
+      "train_aodt": 5.92093738079071,
+      "train_invalid": 0,
+      "train_wasted": 0,
+      "train_bh_energy": 0.1464716380351441,
+      "power_mean": 0.2000000327825546,
+      "power_std": 2.9802322387695312e-08,
+      "power_min": 0.2000000029802322,
+      "power_max": 0.2000000029802322,
+      "val_reward": -0.9836646432473926,
+      "val_aodt": 9.76801975075404,
+      "val_invalid": 0.0,
+      "val_wasted": 1.075,
+      "val_score": 9.77876975075404,
+      "update_loss": 14.772782325744627,
+      "update_actor_loss": 0.2501633465290069,
+      "update_critic_loss": 29.160449981689453,
+      "update_entropy": 5.760562419891357,
+      "update_approx_kl": -2.781550101360608e-08,
+      "update_clip_fraction": 0.0,
+      "update_explained_variance": 0.087501585483551,
+      "update_grad_norm": 94.18198075294497,
+      "saved_best": true
+    }
+  },
+  "manager": {
+    "validation_only": true,
+    "note": "manager history files log validation metrics rather than PPO-update telemetry in the current implementation.",
+    "last_row": {
+      "episode": 1000,
+      "validation_score": 3.672985408862432,
+      "avg_reward": -3.672985408862432,
+      "avg_aodt": 3.672985408862432,
+      "avg_energy": 0.027478536425624,
+      "avg_positive_violation": 0.0,
+      "avg_queue": 0.0
+    }
+  }
+}

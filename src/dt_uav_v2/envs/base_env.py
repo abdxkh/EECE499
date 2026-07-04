@@ -1,5 +1,5 @@
-# src/dt_uav_v2/envs/base_env.py
-
+import itertools
+import hashlib
 import numpy as np
 
 from dt_uav_v2.config import CONFIG
@@ -58,6 +58,7 @@ class BaseUAVAoDTEnv:
         self.episode_slots = self.config["episode_slots"]  # total slots in one episode
 
         self.slot_duration = self.config["slot_duration"]  # slot duration in seconds
+        self.service_model = self.config.get("service_model", "abstract_same_step")
 
         # -------------------------
         # Area settings
@@ -139,11 +140,17 @@ class BaseUAVAoDTEnv:
 
         self.backhaul_powers = None        # shape: (M,), current backhaul transmit power per source UAV
 
+        self.arrival_schedule = None       # shape: (episode_slots, I), exogenous packet arrivals
+        self.packet_size_schedule = None   # shape: (episode_slots, I), exogenous packet sizes
+        self.current_scenario = None       # replayable scenario snapshot
+        self._all_dt_assignments = None    # cached complete DT-host assignments
+        self._all_dt_assignment_indices = None
+
     # ============================================================
     # Reset and initialization helpers
     # ============================================================
 
-    def reset(self, seed=None):
+    def reset(self, seed=None, scenario=None):
         """
         Start a new episode.
 
@@ -159,80 +166,134 @@ class BaseUAVAoDTEnv:
             dictionary state for debugging.
         """
 
-        if seed is not None:
-            self.rng = np.random.default_rng(seed)
+        if scenario is None:
+            scenario = self.make_scenario_snapshot(seed=seed)
 
-        self.t = 0
-
-        # Random 2D sensor positions inside the square area.
-        # Shape: (I, 2)
-        self.sensor_positions = self.rng.uniform(
-            low=0.0,
-            high=self.area_size,
-            size=(self.I, 2)
-        )
-
-        # Random 2D UAV positions inside the square area.
-        # Shape: (M, 2)
-        self.uav_positions = self.rng.uniform(
-            low=0.0,
-            high=self.area_size,
-            size=(self.M, 2)
-        )
-
-        # Assign sensors to entities.
-        # Each sensor belongs to exactly one entity.
-        self.sensor_entity = self._create_sensor_entity_mapping()
-
-        # Create random storage size for each DT/entity.
-        # Shape: (E,)
-        self.dt_storage = self.rng.uniform(
-            low=self.dt_storage_min,
-            high=self.dt_storage_max,
-            size=self.E
-        )
-
-        # Each UAV has the same storage capacity for now.
-        # Shape: (M,)
-        self.uav_storage_capacity = np.ones(self.M) * self.uav_storage_capacity_value
-
-        # Create initial DT placement.
-        # dt_hosts[e] = m means entity e's DT is hosted on UAV m.
-        self.dt_hosts = self._create_initial_dt_placement()
-
-        # Buffers:
-        # Q[i] = 1 means sensor i has a pending packet.
-        # W[i] = packet size in bits.
-        # U[i] = waiting time of the packet in slots.
-        self.Q = np.zeros(self.I)
-        self.W = np.zeros(self.I)
-        self.U = np.zeros(self.I)
-
-        # AoI starts from zero for every sensor.
-        self.sensor_aoi = np.zeros(self.I)
-
-        # Entity AoDT starts from zero.
-        self.entity_aodt = np.zeros(self.E)
-
-        # Last slot backhaul energy per UAV starts as zero.
-        self.last_backhaul_energy = np.zeros(self.M)
-
-        # Current backhaul transmit power per source UAV.
-        self.backhaul_powers = np.ones(self.M) * self.backhaul_power
-
-        # At the beginning of slot 0, generate the first updates.
-        arrivals, packet_sizes = self.generate_arrivals()
-
-        # No one was served before reset, so served_prev is all zeros.
-        served_prev = np.zeros(self.I)
-
-        # Fill the buffers with initial arrivals.
-        self.update_buffers(arrivals, packet_sizes, served_prev)
-
-        # Update entity AoDT based on sensor AoI.
-        self.update_entity_aodt()
+        self.load_scenario_snapshot(scenario, seed=seed)
 
         return self.get_basic_state()
+
+    def make_scenario_snapshot(self, seed=None):
+        """
+        Create a replayable scenario snapshot containing all exogenous randomness.
+        """
+
+        scenario_seed = self.config["seed"] if seed is None else seed
+        rng = np.random.default_rng(scenario_seed)
+
+        sensor_positions = rng.uniform(
+            low=0.0,
+            high=self.area_size,
+            size=(self.I, 2),
+        ).astype(np.float32)
+        uav_positions = rng.uniform(
+            low=0.0,
+            high=self.area_size,
+            size=(self.M, 2),
+        ).astype(np.float32)
+        sensor_entity = self._create_sensor_entity_mapping()
+        dt_storage = rng.uniform(
+            low=self.dt_storage_min,
+            high=self.dt_storage_max,
+            size=self.E,
+        ).astype(np.float32)
+        uav_storage_capacity = (
+            np.ones(self.M, dtype=np.float32) * self.uav_storage_capacity_value
+        )
+
+        if self.config.get("manager_host_action_mode", "feasible_enum") == "legacy_repair":
+            initial_dt_hosts = self._repair_dt_storage(
+                rng.integers(low=0, high=self.M, size=self.E),
+                dt_storage=dt_storage,
+                uav_storage_capacity=uav_storage_capacity,
+            ).astype(int)
+        else:
+            initial_dt_hosts = self.sample_random_feasible_dt_assignment(
+                rng=rng,
+                dt_storage=dt_storage,
+                uav_storage_capacity=uav_storage_capacity,
+            ).astype(int)
+
+        arrival_schedule = (rng.random((self.episode_slots, self.I)) < self.arrival_prob).astype(
+            np.float32
+        )
+        packet_size_schedule = rng.uniform(
+            low=self.packet_size_min,
+            high=self.packet_size_max,
+            size=(self.episode_slots, self.I),
+        ).astype(np.float32)
+        packet_size_schedule = packet_size_schedule * arrival_schedule
+
+        feasible_set_hash = self.feasible_assignment_hash(
+            dt_storage=dt_storage,
+            uav_storage_capacity=uav_storage_capacity,
+        )
+
+        return {
+            "scenario_seed": int(scenario_seed),
+            "sensor_positions": sensor_positions.copy(),
+            "initial_uav_positions": uav_positions.copy(),
+            "sensor_entity": sensor_entity.copy(),
+            "dt_storage": dt_storage.copy(),
+            "uav_storage_capacity": uav_storage_capacity.copy(),
+            "initial_dt_hosts": initial_dt_hosts.copy(),
+            "initial_backhaul_powers": (
+                np.ones(self.M, dtype=np.float32) * self.backhaul_power
+            ),
+            "arrival_schedule": arrival_schedule.copy(),
+            "packet_size_schedule": packet_size_schedule.copy(),
+            "feasible_assignment_hash": feasible_set_hash,
+        }
+
+    def load_scenario_snapshot(self, scenario, seed=None):
+        """
+        Load a replayable scenario snapshot into the environment state.
+        """
+
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+        else:
+            self.rng = np.random.default_rng(int(scenario.get("scenario_seed", self.config["seed"])))
+
+        self.current_scenario = {
+            key: value.copy() if isinstance(value, np.ndarray) else value
+            for key, value in scenario.items()
+        }
+
+        self.t = 0
+        self.sensor_positions = np.asarray(scenario["sensor_positions"], dtype=np.float32).copy()
+        self.uav_positions = np.asarray(scenario["initial_uav_positions"], dtype=np.float32).copy()
+        self.sensor_entity = np.asarray(scenario["sensor_entity"], dtype=int).copy()
+        self.dt_storage = np.asarray(scenario["dt_storage"], dtype=np.float32).copy()
+        self.uav_storage_capacity = np.asarray(
+            scenario["uav_storage_capacity"],
+            dtype=np.float32,
+        ).copy()
+        self.dt_hosts = np.asarray(scenario["initial_dt_hosts"], dtype=int).copy()
+        self.backhaul_powers = np.asarray(
+            scenario.get(
+                "initial_backhaul_powers",
+                np.ones(self.M, dtype=np.float32) * self.backhaul_power,
+            ),
+            dtype=np.float32,
+        ).copy()
+        self.arrival_schedule = np.asarray(scenario["arrival_schedule"], dtype=np.float32).copy()
+        self.packet_size_schedule = np.asarray(
+            scenario["packet_size_schedule"],
+            dtype=np.float32,
+        ).copy()
+
+        self.Q = np.zeros(self.I, dtype=np.float32)
+        self.W = np.zeros(self.I, dtype=np.float32)
+        self.U = np.zeros(self.I, dtype=np.float32)
+        self.sensor_aoi = np.zeros(self.I, dtype=np.float32)
+        self.entity_aodt = np.zeros(self.E, dtype=np.float32)
+        self.last_backhaul_energy = np.zeros(self.M, dtype=np.float32)
+
+        served_prev = np.zeros(self.I, dtype=np.float32)
+        arrivals, packet_sizes = self.arrivals_for_slot(0)
+        self.update_buffers(arrivals, packet_sizes, served_prev)
+        self.update_entity_aodt()
 
     def _create_sensor_entity_mapping(self):
         """
@@ -276,14 +337,13 @@ class BaseUAVAoDTEnv:
             numpy array of shape (E,)
         """
 
-        dt_hosts = self.rng.integers(low=0, high=self.M, size=self.E)
+        if self.config.get("manager_host_action_mode", "feasible_enum") == "legacy_repair":
+            dt_hosts = self.rng.integers(low=0, high=self.M, size=self.E)
+            return self._repair_dt_storage(dt_hosts)
 
-        # Repair if a UAV exceeds its storage capacity.
-        dt_hosts = self._repair_dt_storage(dt_hosts)
+        return self.sample_random_feasible_dt_assignment(self.rng)
 
-        return dt_hosts
-
-    def _repair_dt_storage(self, dt_hosts):
+    def _repair_dt_storage(self, dt_hosts, dt_storage=None, uav_storage_capacity=None):
         """
         Repair DT placement if any UAV exceeds storage capacity.
 
@@ -296,10 +356,18 @@ class BaseUAVAoDTEnv:
         It only makes sure the initial placement is valid enough for simulation.
         """
 
-        for _ in range(100):  # small safety loop to avoid infinite repair
-            used = self.compute_storage_used(dt_hosts)
+        dt_hosts = np.asarray(dt_hosts, dtype=int).copy()
+        dt_storage = self.dt_storage if dt_storage is None else np.asarray(dt_storage, dtype=float)
+        uav_storage_capacity = (
+            self.uav_storage_capacity
+            if uav_storage_capacity is None
+            else np.asarray(uav_storage_capacity, dtype=float)
+        )
 
-            overloaded_uavs = np.where(used > self.uav_storage_capacity)[0]
+        for _ in range(100):  # small safety loop to avoid infinite repair
+            used = self.compute_storage_used(dt_hosts, dt_storage=dt_storage)
+
+            overloaded_uavs = np.where(used > uav_storage_capacity)[0]
 
             # If no overloaded UAV, placement is valid.
             if len(overloaded_uavs) == 0:
@@ -323,7 +391,7 @@ class BaseUAVAoDTEnv:
                     continue
 
                 # Check if target has enough remaining capacity.
-                if used[target_uav] + self.dt_storage[e] <= self.uav_storage_capacity[target_uav]:
+                if used[target_uav] + dt_storage[e] <= uav_storage_capacity[target_uav]:
                     dt_hosts[e] = target_uav
                     moved = True
                     break
@@ -335,7 +403,7 @@ class BaseUAVAoDTEnv:
 
         return dt_hosts
 
-    def compute_storage_used(self, dt_hosts=None):
+    def compute_storage_used(self, dt_hosts=None, dt_storage=None):
         """
         Compute used storage per UAV.
 
@@ -351,13 +419,118 @@ class BaseUAVAoDTEnv:
         if dt_hosts is None:
             dt_hosts = self.dt_hosts
 
-        used = np.zeros(self.M)
+        dt_storage = self.dt_storage if dt_storage is None else np.asarray(dt_storage, dtype=float)
+        used = np.zeros(self.M, dtype=np.float32)
 
         for e in range(self.E):
             host = dt_hosts[e]
-            used[host] += self.dt_storage[e]
+            used[host] += dt_storage[e]
 
         return used
+
+    def enumerate_all_dt_assignments(self):
+        """
+        Enumerate every complete DT-host assignment in a deterministic order.
+        """
+
+        if self._all_dt_assignments is None:
+            assignments = list(itertools.product(range(self.M), repeat=self.E))
+            self._all_dt_assignments = np.asarray(assignments, dtype=int)
+            self._all_dt_assignment_indices = np.arange(len(assignments), dtype=int)
+
+        return self._all_dt_assignments.copy()
+
+    def feasible_dt_assignment_mask(self, dt_storage=None, uav_storage_capacity=None):
+        """
+        Return a boolean feasibility mask over all complete DT-host assignments.
+        """
+
+        all_assignments = self.enumerate_all_dt_assignments()
+        dt_storage = self.dt_storage if dt_storage is None else np.asarray(dt_storage, dtype=float)
+        uav_storage_capacity = (
+            self.uav_storage_capacity
+            if uav_storage_capacity is None
+            else np.asarray(uav_storage_capacity, dtype=float)
+        )
+
+        used = np.zeros((len(all_assignments), self.M), dtype=np.float32)
+        for e in range(self.E):
+            used[np.arange(len(all_assignments)), all_assignments[:, e]] += dt_storage[e]
+
+        return np.all(used <= uav_storage_capacity[None, :] + 1e-9, axis=1)
+
+    def get_feasible_dt_assignments(self, dt_storage=None, uav_storage_capacity=None):
+        mask = self.feasible_dt_assignment_mask(
+            dt_storage=dt_storage,
+            uav_storage_capacity=uav_storage_capacity,
+        )
+        return self.enumerate_all_dt_assignments()[mask]
+
+    def get_feasible_dt_assignment_indices(self, dt_storage=None, uav_storage_capacity=None):
+        if self._all_dt_assignment_indices is None:
+            self.enumerate_all_dt_assignments()
+        mask = self.feasible_dt_assignment_mask(
+            dt_storage=dt_storage,
+            uav_storage_capacity=uav_storage_capacity,
+        )
+        return self._all_dt_assignment_indices[mask].copy()
+
+    def feasible_assignment_hash(self, dt_storage=None, uav_storage_capacity=None):
+        feasible_indices = self.get_feasible_dt_assignment_indices(
+            dt_storage=dt_storage,
+            uav_storage_capacity=uav_storage_capacity,
+        )
+        digest = hashlib.sha256(feasible_indices.astype(np.int32).tobytes()).hexdigest()
+        return digest
+
+    def sample_random_feasible_dt_assignment(
+        self,
+        rng=None,
+        dt_storage=None,
+        uav_storage_capacity=None,
+    ):
+        """
+        Sample one exactly feasible complete DT-host assignment.
+        """
+
+        rng = self.rng if rng is None else rng
+        feasible = self.get_feasible_dt_assignments(
+            dt_storage=dt_storage,
+            uav_storage_capacity=uav_storage_capacity,
+        )
+        if len(feasible) == 0:
+            raise RuntimeError("No feasible DT-host assignment exists for the current storage setting.")
+
+        idx = int(rng.integers(low=0, high=len(feasible)))
+        return feasible[idx].copy()
+
+    def apply_manager_context(self, uav_positions, dt_hosts, backhaul_powers):
+        """
+        Apply a valid manager context exactly, with no hidden repair or clipping.
+        """
+
+        uav_positions = np.asarray(uav_positions, dtype=np.float32)
+        dt_hosts = np.asarray(dt_hosts, dtype=int)
+        backhaul_powers = np.asarray(backhaul_powers, dtype=np.float32)
+
+        if uav_positions.shape != (self.M, 2):
+            raise ValueError("uav_positions must have shape (num_uavs, 2).")
+        if dt_hosts.shape != (self.E,):
+            raise ValueError("dt_hosts must provide one host per entity.")
+        if backhaul_powers.shape != (self.M,):
+            raise ValueError("backhaul_powers must provide one value per UAV.")
+        if np.any(dt_hosts < 0) or np.any(dt_hosts >= self.M):
+            raise ValueError("dt_hosts contains an invalid UAV index.")
+        if np.any(backhaul_powers < self.backhaul_power_min - 1e-9) or np.any(
+            backhaul_powers > self.backhaul_power_max + 1e-9
+        ):
+            raise ValueError("backhaul_powers must lie within configured physical bounds.")
+        if not np.all(self.compute_storage_used(dt_hosts) <= self.uav_storage_capacity + 1e-9):
+            raise ValueError("dt_hosts must satisfy UAV storage capacities exactly.")
+
+        self.uav_positions = uav_positions.copy()
+        self.dt_hosts = dt_hosts.copy()
+        self.backhaul_powers = backhaul_powers.copy()
 
     # ============================================================
     # Arrival and buffer logic
@@ -391,6 +564,18 @@ class BaseUAVAoDTEnv:
         packet_sizes = packet_sizes * arrivals
 
         return arrivals, packet_sizes
+
+    def arrivals_for_slot(self, slot_index):
+        """
+        Return the exogenous arrivals for a specific slot in the loaded scenario.
+        """
+
+        if self.arrival_schedule is None or self.packet_size_schedule is None:
+            raise RuntimeError("No scenario arrival schedule is loaded.")
+        return (
+            self.arrival_schedule[slot_index].copy(),
+            self.packet_size_schedule[slot_index].copy(),
+        )
 
     def update_buffers(self, arrivals, packet_sizes, served_prev):
         """
@@ -626,11 +811,27 @@ class BaseUAVAoDTEnv:
         - returns debug info.
         """
 
-        # Track which sensors were successfully served in this slot.
-        served = np.zeros(self.I)
+        # Track which sensors were completed successfully in this slot.
+        served = np.zeros(self.I, dtype=np.float32)
 
-        # Track delay experienced by each served sensor.
-        total_delay = np.zeros(self.I)
+        # Track all valid transmission attempts separately from successful completions.
+        attempted = np.zeros(self.I, dtype=np.float32)
+        completed = np.zeros(self.I, dtype=np.float32)
+
+        # Delay components for each sensor attempt.
+        uplink_delay = np.zeros(self.I, dtype=np.float32)
+        backhaul_delay = np.zeros(self.I, dtype=np.float32)
+        processing_delay = np.zeros(self.I, dtype=np.float32)
+        total_delay = np.zeros(self.I, dtype=np.float32)
+        uplink_rate = np.zeros(self.I, dtype=np.float32)
+        backhaul_rate = np.zeros(self.I, dtype=np.float32)
+        selected_uplink_power = np.zeros(self.I, dtype=np.float32)
+        selected_backhaul_power = np.zeros(self.I, dtype=np.float32)
+        sensor_uav_distance = np.zeros(self.I, dtype=np.float32)
+        uav_host_distance = np.zeros(self.I, dtype=np.float32)
+        packet_sizes = np.zeros(self.I, dtype=np.float32)
+        direct_upload = np.zeros(self.I, dtype=np.float32)
+        transmission_records = []
 
         # Backhaul energy consumed by each UAV in this slot.
         backhaul_energy = np.zeros(self.M)
@@ -694,30 +895,35 @@ class BaseUAVAoDTEnv:
                 continue
 
             selected_sensors.add(sensor_id)
+            attempted[sensor_id] = 1.0
 
             # Power chosen by the worker. In discrete mode, power_index is an
             # index. In continuous mode, it is the actual transmit power.
             if self.config.get("worker_continuous_power", False):
-                power = float(
-                    np.clip(
-                        power_index,
-                        min(self.sensor_power_levels),
-                        max(self.sensor_power_levels),
-                    )
-                )
+                power = float(power_index)
+                if power < min(self.sensor_power_levels) - 1e-9 or power > max(self.sensor_power_levels) + 1e-9:
+                    raise ValueError("Continuous worker power lies outside configured physical bounds.")
             else:
                 power = self.sensor_power_levels[power_index]
 
             # Packet size to transmit.
             packet_size = self.W[sensor_id]
+            packet_sizes[sensor_id] = packet_size
+            selected_uplink_power[sensor_id] = power
 
             # -------------------------
             # Uplink delay
             # -------------------------
 
+            sensor_distance = float(
+                np.linalg.norm(self.sensor_positions[sensor_id] - self.uav_positions[m])
+            )
             R_ul = self.uplink_rate(sensor_id, m, power)
 
             tau_ul = packet_size / R_ul
+            sensor_uav_distance[sensor_id] = sensor_distance
+            uplink_rate[sensor_id] = R_ul
+            uplink_delay[sensor_id] = tau_ul
 
             # -------------------------
             # Backhaul delay and energy
@@ -729,6 +935,9 @@ class BaseUAVAoDTEnv:
 
             tau_bh = 0.0
             e_bh = 0.0
+            bh_power = 0.0
+            R_bh = 0.0
+            host_distance = 0.0
 
             # If the serving UAV does not host the sensor's entity DT,
             # then forwarding over backhaul is required.
@@ -736,6 +945,9 @@ class BaseUAVAoDTEnv:
                 bh_power = self.backhaul_powers[m]
 
                 R_bh = self.backhaul_rate(m, dt_host, power=bh_power)
+                host_distance = float(
+                    np.linalg.norm(self.uav_positions[m] - self.uav_positions[dt_host])
+                )
 
                 tau_bh = packet_size / R_bh
 
@@ -743,21 +955,63 @@ class BaseUAVAoDTEnv:
 
                 # Energy is charged to the forwarding/source UAV.
                 backhaul_energy[m] += e_bh
+            else:
+                direct_upload[sensor_id] = 1.0
+
+            selected_backhaul_power[sensor_id] = bh_power
+            backhaul_rate[sensor_id] = R_bh
+            backhaul_delay[sensor_id] = tau_bh
+            uav_host_distance[sensor_id] = host_distance
 
             # -------------------------
             # Processing delay
             # -------------------------
 
             tau_proc = self.processing_delay(sensor_id)
+            processing_delay[sensor_id] = tau_proc
 
             # -------------------------
             # Total end-to-end delay
             # -------------------------
 
             delay = tau_ul + tau_bh + tau_proc
-
-            served[sensor_id] = 1
             total_delay[sensor_id] = delay
+            completion_success = (
+                True
+                if self.service_model == "abstract_same_step"
+                else bool(delay <= self.slot_duration + 1e-9)
+            )
+            if self.service_model not in {"abstract_same_step", "require_within_slot"}:
+                raise ValueError(f"Unknown service model: {self.service_model}")
+
+            if completion_success:
+                served[sensor_id] = 1.0
+                completed[sensor_id] = 1.0
+
+            transmission_records.append(
+                {
+                    "time_slot": int(self.t),
+                    "sensor_id": int(sensor_id),
+                    "uav_id": int(m),
+                    "entity_id": int(entity_id),
+                    "dt_host_uav": int(dt_host),
+                    "direct_upload": bool(m == dt_host),
+                    "cross_upload": bool(m != dt_host),
+                    "attempted": True,
+                    "completed": bool(completion_success),
+                    "selected_uplink_power": float(power),
+                    "selected_backhaul_power": float(bh_power),
+                    "sensor_uav_distance": float(sensor_distance),
+                    "uav_host_distance": float(host_distance),
+                    "packet_size_bits": float(packet_size),
+                    "uplink_rate_bps": float(R_ul),
+                    "backhaul_rate_bps": float(R_bh),
+                    "uplink_delay_s": float(tau_ul),
+                    "backhaul_delay_s": float(tau_bh),
+                    "processing_delay_s": float(tau_proc),
+                    "total_delay_s": float(delay),
+                }
+            )
 
         # --------------------------------------------------------
         # Update AoI after serving decisions
@@ -791,7 +1045,7 @@ class BaseUAVAoDTEnv:
         # --------------------------------------------------------
 
         if not done:
-            arrivals, packet_sizes = self.generate_arrivals()
+            arrivals, packet_sizes = self.arrivals_for_slot(self.t)
             self.update_buffers(arrivals, packet_sizes, served)
 
         # --------------------------------------------------------
@@ -801,7 +1055,23 @@ class BaseUAVAoDTEnv:
         info = {
             "time": self.t,
             "served": served,
+            "attempted": attempted,
+            "completed": completed,
             "total_delay": total_delay,
+            "uplink_delay": uplink_delay,
+            "backhaul_delay": backhaul_delay,
+            "processing_delay": processing_delay,
+            "uplink_rate": uplink_rate,
+            "backhaul_rate": backhaul_rate,
+            "selected_uplink_power": selected_uplink_power,
+            "selected_backhaul_power": selected_backhaul_power,
+            "sensor_uav_distance": sensor_uav_distance,
+            "uav_host_distance": uav_host_distance,
+            "packet_size_bits": packet_sizes,
+            "direct_upload": direct_upload,
+            "transmission_records": transmission_records,
+            "completion_rate": float(np.mean(completed[attempted > 0.5])) if np.any(attempted > 0.5) else 0.0,
+            "service_model": self.service_model,
             "backhaul_energy": backhaul_energy,
             "invalid_count": invalid_count,
             "wasted_count": wasted_count,
@@ -896,6 +1166,8 @@ class BaseUAVAoDTEnv:
             "uav_positions": self.uav_positions.copy(),
             "sensor_entity": self.sensor_entity.copy(),
             "dt_hosts": self.dt_hosts.copy(),
+            "dt_storage": self.dt_storage.copy(),
+            "uav_storage_capacity": self.uav_storage_capacity.copy(),
             "Q": self.Q.copy(),
             "W": self.W.copy(),
             "U": self.U.copy(),

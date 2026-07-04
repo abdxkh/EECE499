@@ -17,7 +17,7 @@ CONFIG = {
 
     "slot_duration": 1.0,  # duration of one time slot in seconds
 
-    "manager_horizon": 10,  # manager acts once every H slots
+    "manager_horizon": 5,  # manager acts once every H worker slots in the final experiments
 
     "manager_grid_size": 4,  # manager chooses UAV hover points from a grid_size x grid_size grid
 
@@ -52,6 +52,8 @@ CONFIG = {
     "sensor_power_levels": [0.05, 0.1, 0.15, 0.2],  # available sensor transmit power levels in watts
 
     "worker_continuous_power": True,  # worker outputs continuous sensor power in [min, max]
+
+    "worker_power_mode": "fixed_max",  # one of: learned_beta, fixed_max, fixed_mid
 
     "backhaul_power": 1.0,  # default UAV backhaul transmit power in watts
 
@@ -93,17 +95,46 @@ CONFIG = {
 
     "aodt_delta_weight": 2.0,  # reward improvements in AoDT and punish slot-to-slot AoDT increases
 
+    "worker_reward_mode": "current",  # worker PPO reward used in the saved experiments
+
     "aoi_obs_norm": 20.0,  # normalize AoI/AoDT observations to a useful learning scale
 
     "worker_freshness_bias": 4.0,  # policy prior toward high-AoI sensors during worker sampling
 
-    "worker_force_max_power": False,  # continuous worker power is learned by PPO
+    "worker_force_max_power": False,  # fixed_max mode handles the final fixed uplink power behavior
 
     "invalid_action_penalty": 0.05,  # tiny guardrail penalty; AoDT should dominate worker learning
 
     "wasted_slot_penalty": 0.01,  # tiny guardrail penalty; AoDT should dominate worker learning
 
     "lyapunov_beta": 5.0,  # weight of the Lyapunov virtual queue penalty in manager reward
+
+    "manager_reward_mode": "queue_weighted_energy",  # one of: legacy_queue_penalty, queue_weighted_energy
+
+    "manager_host_action_mode": "feasible_enum",  # one of: feasible_enum, legacy_repair
+
+    "manager_aodt_weight": 20.0,  # V coefficient for normalized window AoDT in manager reward
+
+    "manager_energy_weight": 1.0,  # lambda coefficient for queue-weighted normalized backhaul energy
+
+    "worker_context_mode": "random_feasible_context",  # one of: fixed_context, random_feasible_context, heuristic_context
+
+    "validation_worker_scenarios": 40,  # number of held-out validation scenarios for worker checkpointing
+
+    "validation_manager_scenarios": 40,  # number of held-out validation scenarios for manager checkpointing
+
+    "test_scenarios_default": 200,  # final shared test-scenario count
+
+    "scenario_seed_offsets": {
+        "train": 0,
+        "validation": 10_000,
+        "test": 20_000,
+    },
+
+    "obs_spec_version": "phase_b_v1",
+    "env_version": "phase_b5_v1",
+    "scenario_distribution_version": "phase_b5_v1",
+    "service_model": "require_within_slot",  # one of: abstract_same_step, require_within_slot
 
     # -------------------------
     # PPO hyperparameters
@@ -112,7 +143,9 @@ CONFIG = {
 
     "worker_lr": 3e-4,  # learning rate for worker PPO
 
-    "manager_lr": 3e-4,  # learning rate for manager PPO
+    "manager_lr": 1e-4,  # learning rate for manager PPO in the selected final configuration
+
+    "manager_entropy_coef": 0.01,  # entropy coefficient for the selected final manager PPO
 
     "gamma": 0.99,  # discount factor for future rewards
 

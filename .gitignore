@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 .venv/
+
+# Large generated experiment artifacts kept locally, not in GitHub.
+outputs/results/phase_c2_full/
+outputs/results/phase_c2_final/raw/
+outputs/results/phase_c2_final/test_per_window.csv
